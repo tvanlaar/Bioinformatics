@@ -1,0 +1,3 @@
+qiime tools export \
+  --input-path demux.qza \
+  --output-path sequences

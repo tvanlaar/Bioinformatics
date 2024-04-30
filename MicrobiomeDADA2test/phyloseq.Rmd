@@ -1,0 +1,181 @@
+---
+title: "Phyloseq Demo"
+author: "Tricia"
+date: "`r Sys.Date()`"
+output: pdf_document
+---
+# load library
+```{r}
+library(phyloseq)
+library(ggplot2)
+library(ggpubr)
+library(plyr)
+library(dplyr)
+library(BiMiCo)
+```
+
+# Load taxa and seqtab.nochim
+```{r}
+load("RData/taxa.RData")
+load("RData/seqtab.nochim.RData")
+```
+
+# import metadata
+```{r}
+metadata<-read.csv("metadata.csv", header=TRUE, row.names = 1)
+```
+
+# create phyloseq object
+```{r}
+#make sure the seqtab.nochim and taxa objects are loaded
+physeq <- phyloseq(otu_table(seqtab.nochim, taxa_are_rows=FALSE), 
+               sample_data(metadata), 
+               tax_table(taxa))
+physeq
+```
+
+# transform sample counts
+```{r}
+# convert from raw to abundance
+physeq <- transform_sample_counts(physeq, function(abund) 1*(abund>0))
+physeq
+```
+
+# Remove the sequence itself and replace with ASV
+```{r}
+dna <- Biostrings::DNAStringSet(taxa_names(physeq))
+names(dna) <- taxa_names(physeq)
+physeq <- merge_phyloseq(physeq, dna)
+taxa_names(physeq) <- paste0("ASV", seq(ntaxa(physeq)))
+physeq
+```
+
+# remove mitochondria and chloroplast matches. remove all non bacterial sequences
+```{r}
+physeq <- physeq %>% subset_taxa( Family!= "Mitochondria" | is.na(Family) & Order!="Chloroplast" | is.na(Order) ) 
+physeq
+```
+
+# remove all non bacterial sequences
+```{r}
+physeq<-rm_nonbac(physeq)
+physeq
+```
+
+# save physeq objects to load later
+```{r}
+save(physeq, file="RData/physeq.RData")
+```
+
+# load physeq objects to start here
+```{r}
+load("RData/physeq.RData")
+```
+
+# plot bar graph based on phylum
+```{r}
+plot_bar(physeq, fill = "Phylum")
+```
+
+# Bar plots of Abundance per individual samples by body site (Phylum-Merge <1%)
+```{r}
+physeq2 = filter_taxa(physeq, function(x) mean(x) > 0.01, TRUE)
+physeq3 = transform_sample_counts(physeq2, function(x) x / sum(x) )
+glom<-psmelt(physeq3)
+glom <- tax_glom(physeq3, taxrank = 'Phylum')
+data<-psmelt(glom)
+data$Phylum <- as.character(data$Phylum) 
+data$Phylum[data$Abundance < 0.01] <- "< 1% abund."
+medians <- ddply(data, ~Phylum, function(x) c(median=median(x$Abundance)))
+remainder <- medians[medians$median <= 0.05,]$Phylum
+data[data$Phylum %in% remainder,]$Phylum <- "< 5% abund."
+data$Phylum[data$Abundance < 0.050] <- "< 5% abund."
+spatial_plot <- ggplot(data=data, aes(x=sample, y=Abundance, fill=Phylum)) + 
+  facet_wrap(~body.site, scales = "free")
+barplotphylum<-spatial_plot + geom_bar(aes(), stat="identity", position="fill") + 
+  ggtitle("Phylum Abundance at Each Time Point") + 
+  theme (axis.text.x = element_text(angle=90), 
+         plot.title = element_text(size = 10, face = "bold", hjust = .5)) 
+barplotphylum
+```
+
+# plot alpha diversity based on body.site
+```{r}
+plot_richness(physeq, x="body.site", color= "subject", measures=c("Observed","Simpson", "Shannon"))
+```
+
+# plot alpha diversity based on reported.antibiotic.usage
+```{r}
+plot_richness(physeq, x="reported.antibiotic.usage", color= "body.site", measures=c("Observed","Simpson", "Shannon"))
+```
+
+##Alpha Diversity based on sex with stats
+```{r warning=FALSE, message=FALSE}
+p=plot_richness(physeq,x="reported.antibiotic.usage", measures=c("Observed","Simpson", "Shannon"))
+BAR <- p + geom_boxplot(data = p$data, aes(x = reported.antibiotic.usage, y = value, color = NULL), alpha = 0.1) + theme(axis.title = element_text(face="bold"))
+
+bar <-BAR + stat_compare_means(aes(label = paste0("p = ", ..p.format..)), method = "wilcox.test",  label.x = 1.3, label.y = 0)
+
+BARqalpha<-bar+ stat_compare_means(aes(label = ..p.signif..), method = "wilcox.test",  label.x = 1.5)
+
+BARqalpha
+```
+
+# plot alpha diversity based on subject
+```{r}
+plot_richness(physeq, x="subject", color= "body.site", measures=c("Observed","Simpson", "Shannon"))
+```
+
+# test for normality
+```{r}
+alpha <- estimate_richness(physeq, measures=c("Observed","Simpson", "Shannon"))
+
+# shapiro-wilk
+observed <- shapiro.test(alpha$Observed)
+shannon <- shapiro.test(alpha$Shannon)
+simpson <- shapiro.test(alpha$Simpson)
+
+# print
+print(observed)
+print(shannon)
+print(simpson)
+```
+
+
+# statistics on subject
+```{r}
+samples <- sample_data(physeq)
+
+# Create data frames for subjects 1 and 2
+subject1 <- alpha[samples$subject == 'subject-1',]
+subject2 <- alpha[samples$subject == 'subject-2',]
+
+# Perform t tests for each biodiversity index
+test_observed <- wilcox.test(subject1$Observed, no$Observed)
+test_simpson <- wilcox.test(subject1$Simpson, no$Simpson)
+test_shannon <- wilcox.test(subject1$Shannon, subject2$Shannon)
+
+# Printing the results
+print(test_observed)
+print(test_simpson)
+print(test_shannon)
+```
+
+# statistics on reported.antibiotic.usage
+```{r}
+# Create data frames for those who reported using antibiotics ('Yes') and those who did not ('No')
+yes <- alpha[samples$reported.antibiotic.usage == 'Yes',]
+no <- alpha[samples$reported.antibiotic.usage == 'No',]
+
+# Perform t tests for each biodiversity index
+test_observed <- wilcox.test(yes$Observed, no$Observed)
+test_simpson <- wilcox.test(yes$Simpson, no$Simpson)
+test_shannon <- wilcox.test(yes$Shannon, no$Shannon)
+
+# Printing the results
+print(test_observed)
+print(test_simpson)
+print(test_shannon)
+```
+
+# test for body site

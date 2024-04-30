@@ -1,0 +1,1466 @@
+---
+title: "DADA2 and phyloseq"
+author: "Tricia"
+date: "`r Sys.Date()`"
+output: pdf_document
+---
+
+##Load required packages
+```{r warning=FALSE, message=FALSE}
+library(ggplot2)
+library(dada2)
+library(phyloseq)
+library(vegan)
+library(plyr)
+library(decontam)
+library(BiMiCo)
+library(Biostrings)
+library(tidyverse)
+library(ggpubr)
+library(microbiome)
+library(MicEco)
+library(ANCOMBC)
+library(lme4)
+library(dplyr)
+```
+##Provide path to sequences
+```{r}
+path <- "sequences"
+list.files(path)
+```
+
+##Import file names and make matched list
+```{r}
+fns <- sort(list.files(path, pattern="_R1_001.fastq.gz", full.names = TRUE))
+# Extract sample names, assuming filenames have format: SAMPLENAME_XXX.fastq
+sample.names <- sapply(strsplit(basename(fns), "_"), `[`, 1)
+```
+
+##Inspect read quality
+```{r}
+plotQualityProfile(fns[1:2])
+```
+
+##Assign file names for filtered reads
+```{r}
+# Place filtered files in filtered/ subdirectory
+filts <- file.path(path, "filtered", paste0(sample.names, "_filt.fastq.gz"))
+names(filts) <- sample.names
+```
+
+##Filter reads
+```{r}
+# Filter based on quality plots above. 
+out <- filterAndTrim(fns, filts, truncLen=c(110),
+              maxN=0, maxEE=c(2), truncQ=2, rm.phix=TRUE,
+              compress=TRUE, multithread=TRUE)
+head(out)
+```
+
+##learn error rates 
+```{r}
+err <- learnErrors(filts, multithread=TRUE)
+plotErrors(err, nominalQ=TRUE)
+```
+
+##Dereplicate
+```{r}
+dereps <- derepFastq(filts)
+# Name the derep-class objects by the sample names
+names(dereps) <- sample.names
+```
+
+##Sample Inference reads
+```{r}
+dadas <- dada(dereps, err=err, multithread=TRUE)
+dadas[[1]]
+```
+
+##Construct the sequence table
+```{r}
+seqtab <- makeSequenceTable(dadas)
+dim(seqtab)
+# Inspect distribution of sequence lengths
+table(nchar(getSequences(seqtab)))
+```
+
+##Remove sequences that are too long or too short
+```{r}
+seqtab <- seqtab[,nchar(colnames(seqtab)) %in% 100:115]
+#check new sequence length
+dim(seqtab)
+table(nchar(getSequences(seqtab)))
+```
+
+##Remove chimeras
+```{r}
+seqtab.nochim <- removeBimeraDenovo(seqtab, method="consensus", multithread=TRUE, verbose=TRUE)
+dim(seqtab.nochim)
+#Determine % chimeric abundance
+sum(seqtab.nochim)/sum(seqtab)
+```
+
+## remove ASVs found in 1 sample
+```{r}
+keep <- colSums(seqtab.nochim>0) > 1 # TRUE if ASV in >1 samples
+seqtab.prevalence.filtered <- seqtab.nochim[,keep]
+```
+
+##random notes
+##remove samples with reads fewer than 10000
+st <- seqtab.nochim[rowSums(seqtab.nochim) >= 10000,]
+
+##Track reads through pipeline
+```{r}
+getN <- function(x) sum(getUniques(x))
+track <- cbind(out, sapply(dadas, getN), rowSums(seqtab.nochim), rowSums(seqtab.prevalence.filtered))
+# If processing a single sample, remove the sapply calls: e.g. replace sapply(dadaFs, getN) with getN(dadaFs)
+colnames(track) <- c("input", "filtered", "denoised", "nonchim", "prevfiltered")
+rownames(track) <- sample.names
+head(track)
+```
+##Save seqtab.prevalence.filtered as an R file
+```{r}
+save(seqtab.prevalence.filtered, file="RData/seqtab.prevalence.filtered.RData")
+```
+
+##Load seqtab.prevalence.filtered to start here
+```{r}
+load("Rdata/seqtab.prevalence.filtered.RData")
+```
+
+##Assign taxonomy to filtered
+```{r}
+#Download taxonomy file from https://zenodo.org/record/4587955 and place it in working directory
+
+#assign taxonomy. make sure file name corresponds with downloaded file
+taxa <- assignTaxonomy(seqtab.prevalence.filtered, "silva_nr99_v138.1_wSpecies_train_set.fa.gz", multithread=TRUE)
+
+#inspect taxonomy
+taxa.print <- taxa # Removing sequence rownames for display only
+rownames(taxa.print) <- NULL
+head(taxa.print)
+```
+
+##Save taxa as an R file
+```{r}
+save(taxa, file="RData/taxa.RData")
+```
+
+##Load taxa to start here
+```{r}
+load("RData/taxa.RData")
+```
+
+##import metadata
+```{r}
+metadata<-read.csv("metadata.csv", header=TRUE, row.names = 1)
+```
+
+##Create phyloseq object
+```{r}
+#make sure the seqtab.nochim and taxa objects are loaded
+physeq <- phyloseq(otu_table(seqtab.prevalence.filtered, taxa_are_rows=FALSE), 
+               sample_data(metadata), 
+               tax_table(taxa))
+physeq
+```
+
+##transform sample counts
+```{r}
+# convert from raw to abundance
+physeq <- transform_sample_counts(physeq, function(abund) 1*(abund>0))
+physeq
+```
+
+##Remove the sequence itself and replace with ASV
+```{r}
+dna <- Biostrings::DNAStringSet(taxa_names(physeq))
+names(dna) <- taxa_names(physeq)
+physeq <- merge_phyloseq(physeq, dna)
+taxa_names(physeq) <- paste0("ASV", seq(ntaxa(physeq)))
+physeq
+```
+
+##remove mitochondria and chloroplast matches. remove all non bacterial sequences
+```{r}
+physeq <- physeq %>% subset_taxa( Family!= "Mitochondria" | is.na(Family) & Order!="Chloroplast" | is.na(Order) ) 
+physeq
+```
+##remove all non bacterial sequences
+```{r}
+physeq<-rm_nonbac(physeq)
+physeq
+```
+
+##save physeq objects to load later
+```{r}
+save(physeq, file="RData/physeq.RData")
+```
+
+##load physeq objects to start here
+```{r}
+load("RData/physeq.RData")
+```
+
+# Alpha Diversity based on body site
+```{r warning=FALSE, message=FALSE}
+p=plot_richness(physeq,x="body.site", measures=c("Observed","Simpson", "Shannon"))
+barbody=p + geom_boxplot(data = p$data, aes(x = body.site, y = value), alpha = 0.1) + theme(axis.title = element_text(face="bold"))
+barbody
+```
+
+##Alpha Diversity based on antibiotic usage with stats
+```{r warning=FALSE, message=FALSE}
+p=plot_richness(physeq,x="reported.antibiotic.usage", measures=c("Observed","Simpson", "Shannon"))
+BAR <- p + geom_boxplot(data = p$data, aes(x = reported.antibiotic.usage, y = value, color = NULL), alpha = 0.1) + theme(axis.title = element_text(face="bold"))
+
+bar <- BAR + stat_compare_means(aes(label = ifelse(..p.signif.. < 0.05, ..p.signif.., "")), method = "wilcox.test", label.x = 1.3, label.y = Inf)
+
+barab<-bar+ stat_compare_means(aes(label = ..p.signif..), method = "wilcox.test",  label.x = 1.5)
+
+barab
+```
+
+##Alpha Diversity based on subject with stats
+```{r warning=FALSE, message=FALSE}
+p=plot_richness(physeq,x="subject", measures=c("Observed","Simpson", "Shannon"))
+BAR <- p + geom_boxplot(data = p$data, aes(x = subject, y = value, color = NULL), alpha = 0.1) + theme(axis.title = element_text(face="bold"))
+
+bar <- BAR + stat_compare_means(aes(label = ifelse(..p.signif.. < 0.05, ..p.signif.., "")), method = "wilcox.test", label.x = 1.3, label.y = Inf)
+
+barsub<-bar+ stat_compare_means(aes(label = ..p.signif..), method = "wilcox.test",  label.x = 1.5)
+
+barsub
+```
+
+##grid alpha div
+```{r}
+alpha=ggarrange(barbody, barsub, barab, 
+          labels = c("A", "B", "C"),
+          ncol = 3, nrow = 1)
+alpha
+```
+
+##export tiff with 300dpi
+```{r}
+ggsave(
+  filename="figures/Figure01AlphaDiv.tiff",
+  plot = alpha,
+  width = 300,
+  height = 100,
+  units = c("mm"),
+  dpi = 300,
+)
+```
+
+##Export alpha diveristy
+```{r}
+alphadiv<-estimate_richness(physeq, measures=c("Observed", "Shannon", "Simpson"))
+write.csv(alphadiv, "sheets/alpha_div.csv")
+```
+
+##Import alpha sheet
+```{r}
+meta<-read.csv("sheets/alpha_div_meta.csv")
+```
+
+##hist
+```{r}
+par(mfrow = c(1, 3))
+hist(meta$Shannon, main="Shannon diversity", xlab="", breaks=10)
+hist(meta$Simpson, main="Simpson diversity", xlab="", breaks=10)
+hist(meta$Observed, main="Observed ASVs", xlab="", breaks=10)
+```
+##Test for normality 
+```{r}
+shapiro.test(meta$Shannon)
+shapiro.test(meta$Simpson)
+shapiro.test(meta$Observed)
+```
+
+##Wilcoxon Rank Sum Tests 
+```{r}
+##reported.antibiotic.usage
+wilcox.test(meta$Simpson ~ meta$reported.antibiotic.usage)
+wilcox.test(meta$Observed ~ meta$reported.antibiotic.usage)
+wilcox.test(meta$Shannon ~ meta$reported.antibiotic.usage)
+wilcox.test()
+```
+
+##subject
+```{r}
+wilcox.test(meta$Simpson ~ meta$subject)
+wilcox.test(meta$Observed ~ meta$subject)
+wilcox.test(meta$Shannon ~ meta$subject)
+```
+
+##Remove taxa with relative abundance <0.005%
+```{r}
+minTotRelAbun = .00005
+x = taxa_sums(physeq)
+keepTaxa = (x / sum(x)) > minTotRelAbun
+physeqprune = prune_taxa(keepTaxa, physeq)
+physeqprune
+```
+
+##Determine prevelance of ASVs across all samples
+```{r}
+prevalence=prevalence(
+  physeq,
+  detection = 0,
+  sort = FALSE,
+  count = FALSE,
+  include.lowest = FALSE
+)
+
+write.csv(prevalence,"prevelance.csv")
+```
+
+##Create graph of ASV prevelance (data from prevelance.csv)
+```{r}
+data<-data.frame(
+  NumberofASVs=c(1003,342,136,67,35,21,13,18,9,12,4,3,4,4,1,2,1,0,0,0),   
+  SamplePercent=c(5,10,15,20,25,30,35,40,45,50,55,60,65,70,75,80,85,90,95,100))
+
+ggplot(data, aes(y=NumberofASVs, x=SamplePercent)) + 
+  geom_bar(stat = "identity")
+```
+
+##Number of shared ASVs flocks (found in 75% or more) t=0
+```{r}
+flock=ps_venn(
+  physeqprune,
+  "body.site",
+  fraction = .75,
+  weight = FALSE,
+  relative = TRUE,
+  plot = TRUE
+)
+flock
+```
+
+##Number of shared ASVs population (found in 75% or more) t=0
+```{r}
+population=ps_venn(
+  physeqprune0,
+  "population",
+  fraction = .75,
+  weight = FALSE,
+  relative = TRUE,
+  plot = TRUE
+)
+population
+```
+
+##Number of shared ASVs sex (found in 75% or more) t=0
+```{r}
+sex=ps_venn(
+  physeqprune0,
+  "sex",
+  fraction = .75,
+  weight = FALSE,
+  relative = TRUE,
+  plot = TRUE
+)
+sex
+```
+
+##List of shared ASVs sex (found in 75% or more) t=0
+```{r}
+sexlist=ps_venn(
+  physeqprune0,
+  "sex",
+  fraction = .75,
+  weight = FALSE,
+  relative = TRUE,
+  plot = FALSE
+)
+sexlist
+```
+
+##List of shared ASVs population (found in 75% or more) t=0
+```{r}
+populationlist=ps_venn(
+  physeqprune0,
+  "population",
+  fraction = .75,
+  weight = FALSE,
+  relative = TRUE,
+  plot = FALSE
+)
+populationlist
+```
+
+##List of shared ASVs flock (found in 75% or more) t=0
+```{r}
+flocklist=ps_venn(
+  physeqprune0,
+  "flock",
+  fraction = .75,
+  weight = FALSE,
+  relative = TRUE,
+  plot = FALSE
+)
+flocklist
+```
+
+##venn diagram grid
+```{r}
+venn=ggarrange(flock,                                                 # First row with scatter plot
+          ggarrange(population, sex, ncol = 2, labels = c("B", "C")), # Second row with box and dot plots
+          nrow = 2, 
+          labels = "A"                                        # Labels of the scatter plot
+          ) 
+venn
+```
+
+##export tiff with 300dpi
+```{r}
+ggsave(
+  filename="Figure03Venn.tiff",
+  plot = venn,
+  width = 200,
+  height = 200,
+  units = c("mm"),
+  dpi = 300,
+  bg = "white"
+)
+```
+
+##Bray Curtis Calculation
+```{r message=FALSE}
+set.seed(777)
+dist = phyloseq::distance(physeqprune, method="bray", weighted=TRUE)
+ordination = ordinate(physeqprune, method="NMDS", distance=dist)
+```
+
+##Bray Curtis Calculation time zero
+```{r message=FALSE}
+set.seed(777)
+dist0 = phyloseq::distance(physeqprune0, method="bray", weighted=TRUE)
+ordination0 = ordinate(physeqprune0, method="NMDS", distance=dist0)
+```
+
+##dist
+```{r}
+beta_boxplot <- function(physeqprune, method = "bray", group) {
+  # Load required libraries
+  library(phyloseq)
+  library(ggplot2)
+
+  # Convert 'timepoint' column to factor with correct levels
+  physeqprune@sam_data$timepoint <- factor(physeqprune@sam_data$timepoint)
+
+  # Identify the correspondence: group and samples
+  group2samp <- list()
+  group_list <- phyloseq::sample_data(physeqprune)[[group]]
+  for (groups in levels(group_list)) {
+    target_group <- which(group_list == groups)
+    group2samp[[groups]] <- phyloseq::sample_names(physeqprune)[target_group]
+  }
+
+  # Calculate beta-diversity
+  beta_div_dist <- phyloseq::distance(physeq = physeqprune, method = method)
+  beta_div_dist <- as(beta_div_dist, "matrix")
+
+  # Create a list of data frames for each group
+  group_dfs <- lapply(names(group2samp), function(group_name) {
+    group_samples <- group2samp[[group_name]]
+    beta_div_values <- beta_div_dist[group_samples, group_samples]
+    beta_div_values <- beta_div_values[lower.tri(beta_div_values)]
+
+    data.frame(
+      sample_pair = combn(group_samples, 2, paste, collapse = "-"),
+      group = group_name,
+      beta_div_method = method,
+      beta_div_value = beta_div_values
+    )
+  })
+
+  # Combine data frames into a single data frame
+  dist_df <- do.call(rbind, group_dfs)
+
+  # Convert the 'group' column to a factor with correct levels
+  dist_df$group <- factor(dist_df$group, levels = levels(group_list))
+
+  # Check if 'beta_div_value' contains any NA values
+  if (any(is.na(dist_df$beta_div_value))) {
+    stop("The 'beta_div_value' column contains NA values. There may be an issue with calculating beta-diversity.")
+  }
+
+  # Create a ggplot2 boxplot
+  plot_boxplot <- ggplot(data = dist_df, aes(x = group, y = beta_div_value, color = group)) + 
+    geom_boxplot(outlier.shape = NA, fill = "transparent", color = "black") +
+    geom_jitter() + 
+    theme_bw() + 
+    xlab(group) + ylab(method) +
+    theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1))
+
+  # Save df and boxplot into a list 
+  list_Out <- list("data" = dist_df, "plot" = plot_boxplot) 
+
+  return(list_Out)
+}
+
+# Test function 
+beta_boxplot_result <- beta_boxplot(physeqprune, method = "bray", group = "timepoint")
+
+## Data
+beta_boxplot_result$data
+
+## Plot
+betabox <- beta_boxplot_result$plot
+
+betabox
+```
+##Export beta diveristy
+```{r}
+write.csv(beta_boxplot_result$data, "beta_div.csv")
+```
+
+##Import betadiv after adding days info (change time 0 to 0, etc)
+```{r}
+beta_div<-read.csv("betadiv.csv")
+```
+
+##beta Diversity Time Point Observed
+```{r}
+braycurtistime<-ggscatter(beta_div, x = "timepoint", y = "beta_div_value", 
+          add = "reg.line", conf.int = TRUE, cor.coef = TRUE, cor.coeff.args = list(method = "pearson", label.x = 3.2, label.sep = "\n"),
+          xlab = "Time", ylab = "Bray-Curtis Dissimilarity")
+braycurtistime
+```
+
+##Bray Curtis Sex Plot
+```{r}
+braysex=plot_ordination(physeqprune, ordination, color="sex") + 
+  theme_classic() +
+  theme(strip.background = element_blank()) + stat_ellipse(aes(group=sex))
+braysex
+```
+
+##Bray Curtis Sex Plot time 0
+```{r}
+braysex0=plot_ordination(physeqprune0, ordination0, color="sex") + 
+  theme_classic() +
+  theme(strip.background = element_blank()) + stat_ellipse(aes(group=sex))
+braysex0
+```
+
+##Bray Curtis Sex Stats
+```{r}
+adonis2(dist ~ sample_data(physeqprune)$sex)
+ps.disper<-betadisper(dist, sample_data(physeqprune)$sex)
+permutest(ps.disper, pair=TRUE)
+```
+
+##Bray Curtis Sex Stats time 0
+```{r}
+adonis2(dist0 ~ sample_data(physeqprune0)$sex)
+ps.disper0<-betadisper(dist0, sample_data(physeqprune0)$sex)
+permutest(ps.disper0, pair=TRUE)
+```
+
+##Bray Curtis Sex ANOSIM
+```{r}
+metadata0 <- data.frame(sample_data(physeq0))
+anosim(dist0, metadata0$sex, permutations=9999)
+```
+
+##Bray Curtis Population Plot
+```{r}
+braypop=plot_ordination(physeqprune, ordination, color="population") + theme_classic() +
+  theme(strip.background = element_blank()) +  stat_ellipse(aes(group=population))
+braypop
+```
+
+##Bray Curtis Population Plot time 0
+```{r}
+braypop0=plot_ordination(physeqprune0, ordination0, color="population") + theme_classic() +
+  theme(strip.background = element_blank()) +  stat_ellipse(aes(group=population))
+braypop0
+```
+
+##Bray Curtis Pop Stats
+```{r}
+adonis2(dist0 ~ sample_data(physeqprune0)$population)
+ps.disper0<-betadisper(dist0, sample_data(physeqprune0)$population)
+permutest(ps.disper0, pair=TRUE)
+```
+
+##Bray Curtis Pop ANOSIM
+```{r}
+metadata <- data.frame(sample_data(physeqprune))
+anosim(dist, metadata$population, permutations=9999)
+```
+
+
+##Bray Curtis Timepoint Plot
+```{r}
+braytimepoint=plot_ordination(physeqprune, ordination, color="timepoint") + 
+  theme_classic() +
+  theme(strip.background = element_blank()) + stat_ellipse(aes(group=timepoint))
+braytimepoint
+```
+
+##Bray Curtis Time Point Stats 
+```{r}
+adonis2(dist ~ sample_data(physeqprune)$timepoint)
+ps.disper<-betadisper(dist, sample_data(physeqprune)$timepoint)
+permutest(ps.disper, pair=TRUE)
+```
+
+##Bray Curtis Timepoint ANOSIM
+```{r}
+metadata <- data.frame(sample_data(physeqprune))
+anosim(dist, metadata$timepoint, permutations=9999)
+```
+
+##Bray Curtis NMDS Flock Plot
+```{r}
+brayflock=plot_ordination(physeqprune, ordination, color="flock") + 
+  theme_classic() +
+  theme(strip.background = element_blank())+ stat_ellipse(aes(group=flock))
+brayflock
+```
+
+##Bray Curtis NMDS Flock Plot time 0
+```{r}
+brayflock0=plot_ordination(physeq0, ordination0, color="flock") + 
+  theme_classic() +
+  theme(strip.background = element_blank())+ stat_ellipse(aes(group=flock))
+brayflock0
+```
+
+##Bray Curtis Flock Stats 
+```{r}
+adonis2(dist ~ sample_data(physeqprune)$flock)
+ps.disper<-betadisper(dist, sample_data(physeqprune)$flock)
+permutest(ps.disper, pair=TRUE)
+```
+
+##Bray Curtis Flock Stats time 0
+```{r}
+adonis2(dist0 ~ sample_data(physeqprune0)$flock)
+ps.disper0<-betadisper(dist0, sample_data(physeqprune0)$flock)
+permutest(ps.disper0, pair=TRUE)
+```
+
+##Bray Curtis Flock ANOSIM
+```{r}
+metadata <- data.frame(sample_data(physeq))
+anosim(dist, metadata$flock, permutations=9999)
+```
+
+##betadiv pair changes
+```{r}
+betadivpair<- read.csv("betadivpair.csv")
+
+#test for normality
+shapiro.test(betadivpair$braycurtis)
+
+#data are not normally distributed (p=0.002791)
+#Friedman test - p=0.0739
+friedman.test(y=betadivpair$braycurtis, groups=betadivpair$timepoint, blocks=betadivpair$pair)
+
+#pairwise
+pairwise.wilcox.test(betadivpair$braycurtis, betadivpair$timepoint, p.adjust.method="holm")
+
+##does spread change over time
+result<-leveneTest(braycurtis ~ time, data=betadivpair)
+result
+```
+
+```{r}
+##graph
+betapair<-ggscatter(betadivpair, x = "timepoint", y = "braycurtis", 
+          add = "reg.line", conf.int = TRUE, cor.coef = TRUE, cor.coeff.args = list(method = "pearson", label.x = 3.1, label.sep = "\n"),
+          xlab = "Time", ylab = "Bray-Curtis Distance")
+betapair
+```
+
+##grid bray
+```{r}
+bray=ggarrange(ggarrange(braysex0, brayflock0, braypop0, braytimepoint, 
+          labels = c("A", "B", "C", "D"),
+          ncol = 2, nrow=2), betabox, nrow=2, labels=c("","E"), heights = c(2.5,1.5))
+
+bray
+```
+##export tiff with 300dpi
+```{r}
+ggsave(
+  filename="Figure04BetaDiv.tiff",
+  plot = bray,
+  width = 250,
+  height = 200,
+  units = c("mm"),
+  dpi = 300,
+)
+```
+
+
+
+##Bar plots of Abundance per individual samples in timepoint (Phylum-Merge <5%)
+```{r}
+physeq2 = filter_taxa(physeqprune, function(x) mean(x) > 0.05, TRUE)
+physeq3 = transform_sample_counts(physeq2, function(x) x / sum(x) )
+glom<-psmelt(physeq3)
+glom <- tax_glom(physeq3, taxrank = 'Phylum')
+data<-psmelt(glom)
+data$Phylum <- as.character(data$Phylum) 
+data$Phylum[data$Abundance < 0.05] <- "< 5% abund."
+medians <- ddply(data, ~Phylum, function(x) c(median=median(x$Abundance)))
+remainder <- medians[medians$median <= 0.05,]$Phylum
+data[data$Phylum %in% remainder,]$Phylum <- "< 5% abund."
+data$Phylum[data$Abundance < 0.050] <- "< 5% abund."
+spatial_plot <- ggplot(data=data, aes(x=bird, y=Abundance, fill=Phylum)) + 
+  facet_wrap(~timepoint, scales = "free")
+barplotphylum<-spatial_plot + geom_bar(aes(), stat="identity", position="fill") + 
+  ggtitle("Phylum Abundance at Each Time Point") + 
+  theme (axis.text.x = element_text(angle=90), 
+         plot.title = element_text(size = 10, face = "bold", hjust = .5)) 
+barplotphylum
+```
+
+##export tiff with 300dpi
+```{r}
+ggsave(
+  filename="Figure00Barplot.tiff",
+  plot = barplotphylum,
+  width = 250,
+  height = 150,
+  units = c("mm"),
+  dpi = 300,
+)
+```
+
+##export otu table of phylum abundance
+```{r}
+# Extract abundance matrix from the phyloseq object
+OTU1 = as(otu_table(glom), "matrix")
+# transpose if necessary
+if(taxa_are_rows(glom)){OTU1 <- t(OTU1)}
+# Coerce to data.frame
+OTUdf = as.data.frame(OTU1)
+#export to csv
+write.csv(OTUdf, "phylumdf.csv", row.names = TRUE)
+```
+
+##Bar plots of Abundance per individual samples in timepoint (Order-Merge <10%)
+```{r}
+physeq2 = filter_taxa(physeq, function(x) mean(x) > 0.1, TRUE)
+physeq3 = transform_sample_counts(physeq2, function(x) x / sum(x) )
+glom<-psmelt(physeq3)
+glom <- tax_glom(physeq3, taxrank = 'Order')
+data<-psmelt(glom)
+data$Order <- as.character(data$Order) 
+data$Order[data$Abundance < 0.1] <- "< 10% abund."
+medians <- ddply(data, ~Order, function(x) c(median=median(x$Abundance)))
+remainder <- medians[medians$median <= 0.1,]$Order
+data[data$Order %in% remainder,]$Order <- "< 10% abund."
+data$Order[data$Abundance < 0.10] <- "< 10% abund."
+spatial_plot <- ggplot(data=data, aes(x=bird, y=Abundance, fill=Order)) + 
+  facet_wrap(~timepoint, scales = "free")
+barplotorder<-spatial_plot + geom_bar(aes(), stat="identity", position="fill") + 
+  ggtitle("Order Abundance at Each Time Point") + 
+  theme (axis.text.x = element_text(angle=90), 
+         plot.title = element_text(size = 10, face = "bold", hjust = .5)) 
+barplotorder
+```
+##export tiff with 300dpi
+```{r}
+ggsave(
+  filename="Figure00BarplotOrder.tiff",
+  plot = barplotorder,
+  width = 250,
+  height = 150,
+  units = c("mm"),
+  dpi = 300,
+)
+```
+
+#Differential species ID timepoint 0 to 1
+```{r}
+#object representing time0-1
+physeqprune01 = subset_samples(physeqprune, time != "2" & time != "3" 
+                         & time != "4" & time != "5")
+
+physeqprune01
+
+out01 <- ancombc(phyloseq = physeqprune01, formula = "timepoint", 
+              p_adj_method = "fdr", lib_cut = 100, 
+              group = "timepoint", struc_zero = TRUE, neg_lb = TRUE, tol = 1e-5, 
+              max_iter = 100, conserve = TRUE, alpha = 0.05, global = FALSE)
+
+res = out01$res
+```
+##create table for export with significant fold change and q value <0.05 for time 01
+```{r}
+# List of result data frames (excluding the intercept column)
+result_dfs <- list(
+  lfc = out01$res$lfc[, -2],
+  se = out01$res$se[, -2],
+  W = out01$res$W[, -2],
+  p_val = out01$res$p_val[, -2],
+  q_val = out01$res$q_val[, -2],
+  diff_abn = out01$res$diff_abn[, -2]
+)
+
+# Combine the data frames, keeping only the taxon column as the key
+combined_df <- Reduce(function(x, y) merge(x, y, by = "taxon"), result_dfs)
+
+# Modify the column names to match the desired names
+new_col_names <- c("taxon", "lfc", "se", "W", "p_val", "q_val", "diff_abn")
+colnames(combined_df) <- new_col_names
+
+# Export the combined data frame to CSV
+write.csv(combined_df, "time01/combined_results.csv", row.names = FALSE)
+
+# Add a new column for log2FC
+combined_df$log2FC <- combined_df$lfc / log(2)
+
+# Export the updated data frame to CSV
+write.csv(combined_df, "time01/combined_results_with_log2FC.csv", row.names = FALSE)
+
+# Filter rows based on log2FC values from time01, there are no samples at 2, so try .75 (1.5 fold change)
+filtered_df <- combined_df[combined_df$log2FC < -.75 | combined_df$log2FC > .75, ]
+
+# Export the filtered data frame to CSV
+write.csv(filtered_df, "time01/filtered_results.csv", row.names = FALSE)
+
+# Filter rows based on q_val values
+final_filtered_df <- filtered_df[filtered_df$q_val <= 0.05, ]
+
+# Export the final filtered data frame to CSV
+write.csv(final_filtered_df, "time01/final_filtered_results.csv", row.names = FALSE)
+
+# Extract ASV identifiers from the final_filtered_df data frame
+asv_identifiers <- final_filtered_df$taxon  # Replace with the actual column name
+
+# Match ASV identifiers with taxonomic information from phyloseq object's tax_table
+matching_rows <- match(asv_identifiers, rownames(tax_table(physeqprune01)))
+
+# Create a data frame with matched taxonomic information
+tax_info <- as.data.frame(tax_table(physeqprune01)[matching_rows, ])
+
+# Combine taxonomic information with the final_filtered_df data frame
+final_result_with_tax <- cbind(final_filtered_df, tax_info)
+
+# Export the final result with taxonomic information to CSV
+write.csv(final_result_with_tax, "final_result_with_tax01.csv", row.names = FALSE)
+```
+
+#Differential species ID timepoint 1 to 2
+```{r}
+#object representing time0-1
+physeqprune12 = subset_samples(physeqprune, time != "0" & time != "3" 
+                         & time != "4" & time != "5")
+
+physeqprune12
+
+out12 <- ancombc(phyloseq = physeqprune12, formula = "timepoint", 
+              p_adj_method = "fdr", lib_cut = 100, 
+              group = "timepoint", struc_zero = TRUE, neg_lb = TRUE, tol = 1e-5, 
+              max_iter = 100, conserve = TRUE, alpha = 0.05, global = FALSE)
+
+res = out12$res
+```
+
+##create table for export with significant fold change and q value <0.05 for time 12
+```{r}
+# List of result data frames (excluding the intercept column)
+result_dfs <- list(
+  lfc = out12$res$lfc[, -2],
+  se = out12$res$se[, -2],
+  W = out12$res$W[, -2],
+  p_val = out12$res$p_val[, -2],
+  q_val = out12$res$q_val[, -2],
+  diff_abn = out12$res$diff_abn[, -2]
+)
+
+# Combine the data frames, keeping only the taxon column as the key
+combined_df <- Reduce(function(x, y) merge(x, y, by = "taxon"), result_dfs)
+
+# Modify the column names to match the desired names
+new_col_names <- c("taxon", "lfc", "se", "W", "p_val", "q_val", "diff_abn")
+colnames(combined_df) <- new_col_names
+
+# Export the combined data frame to CSV
+write.csv(combined_df, "time12/combined_results.csv", row.names = FALSE)
+
+# Add a new column for log2FC
+combined_df$log2FC <- combined_df$lfc / log(2)
+
+# Export the updated data frame to CSV
+write.csv(combined_df, "time12/combined_results_with_log2FC.csv", row.names = FALSE)
+
+# Filter rows based on log2FC values from time12, there are no samples at 2, so try .5 (1 fold change)
+filtered_df <- combined_df[combined_df$log2FC < -.5 | combined_df$log2FC > .5, ]
+
+# Export the filtered data frame to CSV
+write.csv(filtered_df, "time12/filtered_results.csv", row.names = FALSE)
+
+# Filter rows based on q_val values
+final_filtered_df <- filtered_df[filtered_df$q_val <= 0.05, ]
+
+# Export the final filtered data frame to CSV
+write.csv(final_filtered_df, "time12/final_filtered_results.csv", row.names = FALSE)
+
+# Extract ASV identifiers from the final_filtered_df data frame
+asv_identifiers <- final_filtered_df$taxon  # Replace with the actual column name
+
+# Match ASV identifiers with taxonomic information from phyloseq object's tax_table
+matching_rows <- match(asv_identifiers, rownames(tax_table(physeqprune12)))
+
+# Create a data frame with matched taxonomic information
+tax_info <- as.data.frame(tax_table(physeqprune12)[matching_rows, ])
+
+# Combine taxonomic information with the final_filtered_df data frame
+final_result_with_tax <- cbind(final_filtered_df, tax_info)
+
+# Export the final result with taxonomic information to CSV
+write.csv(final_result_with_tax, "final_result_with_tax12.csv", row.names = FALSE)
+```
+
+
+##export otu table for mantel
+```{r}
+# transform sample counts to abundance
+physeqabund = transform_sample_counts(physeq, function(x) x / sum(x) )
+# Extract abundance matrix from the phyloseq object
+OTU1 = as(otu_table(physeqabund), "matrix")
+# transpose if necessary
+if(taxa_are_rows(physeqabund)){OTU1 <- t(OTU1)}
+# Coerce to data.frame
+OTUdf = as.data.frame(OTU1)
+#export to csv
+write.csv(OTUdf, "OTUdf.csv", row.names = TRUE)
+```
+
+##Import and format data for mantel morphometrics
+```{r}
+df<-read.csv("formantelmorphometrics.csv", header=TRUE)
+#abundance data frame
+abund = df[,25:ncol(df)]
+#total oil 
+morph = df[,14:24]
+#abundance data frame - bray curtis dissimilarity
+dist.abund = vegdist(abund, method = "bray")
+
+#morphometric - euclidean distance
+dist.morph = dist(morph, method = "euclidean")
+```
+
+##Bioenv
+```{r eval=FALSE}
+abundoil<-bioenv(dist.abund, oil, method="spearman", index="bray", metric=c("euclidean"))
+```
+
+##Mantel morpho
+```{r}
+#abundance vs morph
+abund_morph = mantel(dist.abund, dist.morph, method = "spearman", permutations = 9999, na.rm = TRUE)
+abund_morph
+```
+
+##Import and format data for mantel
+```{r}
+df<-read.csv("formantel.csv", header=TRUE)
+#abundance data frame
+abund = df[,78:ncol(df)]
+#total oil 
+oil = df[,37:54]
+#abundance data frame - bray curtis dissimilarity
+dist.abund = vegdist(abund, method = "bray")
+
+#oil - euclidean distance
+dist.oil = dist(oil, method = "euclidean")
+```
+
+##Bioenv
+```{r eval=FALSE}
+abundoil<-bioenv(dist.abund, oil, method="spearman", index="bray", metric=c("euclidean"))
+```
+
+##Mantel
+```{r}
+#abundance vs oil
+abund_oil = mantel(dist.abund, dist.oil, method = "spearman", permutations = 9999, na.rm = TRUE)
+abund_oil
+```
+
+##Import and format data for mantel timepoint 0
+```{r}
+df0<-read.csv("formantel0.csv", header=TRUE)
+#abundance data frame
+abund0 = df0[,78:ncol(df0)]
+#total oil 
+oil0 = df0[,37:54]
+#abundance data frame - bray curtis dissimilarity
+dist.abund0 = vegdist(abund0, method = "bray")
+
+#oil - euclidean distance
+dist.oil0 = dist(oil0, method = "euclidean")
+```
+
+##Mantel timepoint 0
+```{r}
+#abundance vs oil
+abund_oil0 = mantel(dist.abund0, dist.oil0, method = "spearman", permutations = 9999, na.rm = TRUE)
+abund_oil0
+```
+
+##Import and format data for mantel timepoint 1
+```{r}
+df1<-read.csv("formanteltimepoint1.csv", header=TRUE)
+#abundance data frame
+abund1 = df1[,78:ncol(df1)]
+#total oil 
+oil1 = df1[,37:54]
+#abundance data frame - bray curtis dissimilarity
+dist.abund1 = vegdist(abund1, method = "bray")
+
+#oil - euclidean distance
+dist.oil1 = dist(oil1, method = "euclidean")
+```
+
+##Mantel timepoint 1
+```{r}
+#abundance vs oil
+abund_oil1 = mantel(dist.abund1, dist.oil1, method = "spearman", permutations = 9999, na.rm = TRUE)
+abund_oil1
+```
+
+##Import and format data for mantel timepoint 2
+```{r}
+df2<-read.csv("formanteltimepoint2.csv", header=TRUE)
+#abundance data frame
+abund2 = df2[,78:ncol(df2)]
+#total oil 
+oil2 = df2[,37:54]
+#abundance data frame - bray curtis dissimilarity
+dist.abund2 = vegdist(abund2, method = "bray")
+
+#oil - euclidean distance
+dist.oil2 = dist(oil2, method = "euclidean")
+```
+
+##Mantel timepoint 2
+```{r}
+#abundance vs oil
+abund_oil2 = mantel(dist.abund2, dist.oil2, method = "spearman", permutations = 9999, na.rm = TRUE)
+abund_oil2
+```
+
+##Import and format data for mantel timepoint 3
+```{r}
+df3<-read.csv("formanteltimepoint3.csv", header=TRUE)
+#abundance data frame
+abund3 = df3[,78:ncol(df3)]
+#total oil 
+oil3 = df3[,37:54]
+#abundance data frame - bray curtis dissimilarity
+dist.abund3 = vegdist(abund3, method = "bray")
+
+#oil - euclidean distance
+dist.oil3 = dist(oil3, method = "euclidean")
+```
+
+##Mantel timepoint 3
+```{r}
+#abundance vs oil
+abund_oil3 = mantel(dist.abund3, dist.oil3, method = "spearman", permutations = 9999, na.rm = TRUE)
+abund_oil3
+```
+
+##Import and format data for mantel timepoint 4
+```{r}
+df4<-read.csv("formanteltimepoint4.csv", header=TRUE)
+#abundance data frame
+abund4 = df4[,78:ncol(df4)]
+#total oil 
+oil4 = df4[,37:54]
+#abundance data frame - bray curtis dissimilarity
+dist.abund4 = vegdist(abund4, method = "bray")
+
+#oil - euclidean distance
+dist.oil4 = dist(oil4, method = "euclidean")
+```
+
+##Mantel timepoint 4
+```{r}
+#abundance vs oil
+abund_oil4 = mantel(dist.abund4, dist.oil4, method = "spearman", permutations = 9999, na.rm = TRUE)
+abund_oil4
+```
+
+##Import and format data for mantel timepoint 5
+```{r}
+df5<-read.csv("formanteltimepoint5.csv", header=TRUE)
+#abundance data frame
+abund5 = df5[,78:ncol(df5)]
+#total oil 
+oil5 = df5[,37:54]
+#abundance data frame - bray curtis dissimilarity
+dist.abund5 = vegdist(abund5, method = "bray")
+
+#oil - euclidean distance
+dist.oil5 = dist(oil5, method = "euclidean")
+```
+
+##Mantel timepoint 5
+```{r}
+#abundance vs oil
+abund_oil5 = mantel(dist.abund5, dist.oil5, method = "spearman", permutations = 9999, na.rm = TRUE)
+abund_oil5
+```
+
+##Import and format data for mantel decanol
+```{r}
+df<-read.csv("formantel.csv", header=TRUE)
+#abundance data frame
+abund = df[,78:ncol(df)]
+#total oil 
+oildecanol = df$Prop1Decanol
+#abundance data frame - bray curtis dissimilarity
+dist.abund = vegdist(abund, method = "bray")
+
+#oil - euclidean distance
+dist.oildecanol = dist(oildecanol, method = "euclidean")
+
+#abundance vs decanol mantel
+abund_decanol = mantel(dist.abund, dist.oildecanol, method = "spearman", permutations = 9999, na.rm = TRUE)
+abund_decanol
+```
+
+##Import and format data for mantel undecanol
+```{r}
+df<-read.csv("formantel.csv", header=TRUE)
+#abundance data frame
+abund = df[,78:ncol(df)]
+#tridecanol
+oilundecanol = df$Prop1Undecanol
+#abundance data frame - bray curtis dissimilarity
+dist.abund = vegdist(abund, method = "bray")
+
+#oil - euclidean distance
+dist.oilundecanol = dist(oilundecanol, method = "euclidean")
+
+#abundance vs tridecanol mantel
+abund_undecanol = mantel(dist.abund, dist.oilundecanol, method = "spearman", permutations = 9999, na.rm = TRUE)
+abund_undecanol
+```
+
+##Import and format data for mantel dodecanol
+```{r}
+df<-read.csv("formantel.csv", header=TRUE)
+#abundance data frame
+abund = df[,78:ncol(df)]
+#dodecanol
+oildodecanol = df$Prop1Dodecanol
+#abundance data frame - bray curtis dissimilarity
+dist.abund = vegdist(abund, method = "bray")
+
+#oil - euclidean distance
+dist.oildodecanol = dist(oildodecanol, method = "euclidean")
+
+#abundance vs dodecanol mantel
+abund_dodecanol = mantel(dist.abund, dist.oildodecanol, method = "spearman", permutations = 9999, na.rm = TRUE)
+abund_dodecanol
+```
+
+##Import and format data for mantel tridecanol
+```{r}
+df<-read.csv("formantel.csv", header=TRUE)
+#abundance data frame
+abund = df[,78:ncol(df)]
+#tridecanol
+oiltridecanol = df$Prop1Tridecanol
+#abundance data frame - bray curtis dissimilarity
+dist.abund = vegdist(abund, method = "bray")
+
+#oil - euclidean distance
+dist.oiltridecanol = dist(oiltridecanol, method = "euclidean")
+
+#abundance vs tridecanol mantel
+abund_tridecanol = mantel(dist.abund, dist.oiltridecanol, method = "spearman", permutations = 9999, na.rm = TRUE)
+abund_tridecanol
+```
+
+##Import and format data for mantel tetradecanol
+```{r}
+df<-read.csv("formantel.csv", header=TRUE)
+#abundance data frame
+abund = df[,78:ncol(df)]
+#tetradecanol
+oiltetradecanol = df$Prop1Tetradecanol
+#abundance data frame - bray curtis dissimilarity
+dist.abund = vegdist(abund, method = "bray")
+
+#oil - euclidean distance
+dist.oiltetradecanol = dist(oiltetradecanol, method = "euclidean")
+
+#abundance vs tetradecanol mantel
+abund_tetradecanol = mantel(dist.abund, dist.oiltetradecanol, method = "spearman", permutations = 9999, na.rm = TRUE)
+abund_tetradecanol
+```
+
+##Import and format data for mantel pentadecanol
+```{r}
+df<-read.csv("formantel.csv", header=TRUE)
+#abundance data frame
+abund = df[,78:ncol(df)]
+#pentadecanol
+oilpentadecanol = df$Prop1Pentadecanol
+#abundance data frame - bray curtis dissimilarity
+dist.abund = vegdist(abund, method = "bray")
+
+#oil - euclidean distance
+dist.oilpentadecanol = dist(oilpentadecanol, method = "euclidean")
+
+#abundance vs pentadecanol mantel
+abund_pentadecanol = mantel(dist.abund, dist.oilpentadecanol, method = "spearman", permutations = 9999, na.rm = TRUE)
+abund_pentadecanol
+```
+
+##Import and format data for mantel hexadecanol
+```{r}
+df<-read.csv("formantel.csv", header=TRUE)
+#abundance data frame
+abund = df[,78:ncol(df)]
+#hexadecanol
+oilhexadecanol = df$Prop1Hexadecanol
+#abundance data frame - bray curtis dissimilarity
+dist.abund = vegdist(abund, method = "bray")
+
+#oil - euclidean distance
+dist.oilhexadecanol = dist(oilhexadecanol, method = "euclidean")
+
+#abundance vs hexadecanol mantel
+abund_hexadecanol = mantel(dist.abund, dist.oilhexadecanol, method = "spearman", permutations = 9999, na.rm = TRUE)
+abund_hexadecanol
+```
+
+##Import and format data for mantel heptadecanol
+```{r}
+df<-read.csv("formantel.csv", header=TRUE)
+#abundance data frame
+abund = df[,78:ncol(df)]
+#heptadecanol
+oilheptadecanol = df$Prop1Heptadecanol
+#abundance data frame - bray curtis dissimilarity
+dist.abund = vegdist(abund, method = "bray")
+
+#oil - euclidean distance
+dist.oilheptadecanol = dist(oilheptadecanol, method = "euclidean")
+
+#abundance vs heptadecanol mantel
+abund_heptadecanol = mantel(dist.abund, dist.oilheptadecanol, method = "spearman", permutations = 9999, na.rm = TRUE)
+abund_heptadecanol
+```
+
+##Import and format data for mantel octadecanol
+```{r}
+df<-read.csv("formantel.csv", header=TRUE)
+#abundance data frame
+abund = df[,78:ncol(df)]
+#octadecanol
+oiloctadecanol = df$Prop1Octadecanol
+#abundance data frame - bray curtis dissimilarity
+dist.abund = vegdist(abund, method = "bray")
+
+#oil - euclidean distance
+dist.oiloctadecanol = dist(oiloctadecanol, method = "euclidean")
+
+#abundance vs octadecanol mantel
+abund_octadecanol = mantel(dist.abund, dist.oiloctadecanol, method = "spearman", permutations = 9999, na.rm = TRUE)
+abund_octadecanol
+```
+
+##Import and format data for mantel undecanone
+```{r}
+df<-read.csv("formantel.csv", header=TRUE)
+#abundance data frame
+abund = df[,78:ncol(df)]
+#undecanone
+oilundecanone = df$Prop2Undecanone
+#abundance data frame - bray curtis dissimilarity
+dist.abund = vegdist(abund, method = "bray")
+
+#oil - euclidean distance
+dist.oilundecanone = dist(oilundecanone, method = "euclidean")
+
+#abundance vs undecanone mantel
+abund_undecanone = mantel(dist.abund, dist.oilundecanone, method = "spearman", permutations = 9999, na.rm = TRUE)
+abund_undecanone
+```
+
+##Import and format data for mantel dodecanone
+```{r}
+df<-read.csv("formantel.csv", header=TRUE)
+#abundance data frame
+abund = df[,78:ncol(df)]
+#dodecanone
+oildodecanone = df$Prop2Dodecanone
+#abundance data frame - bray curtis dissimilarity
+dist.abund = vegdist(abund, method = "bray")
+
+#oil - euclidean distance
+dist.oildodecanone = dist(oildodecanone, method = "euclidean")
+
+#abundance vs dodecanone mantel
+abund_dodecanone = mantel(dist.abund, dist.oildodecanone, method = "spearman", permutations = 9999, na.rm = TRUE)
+abund_dodecanone
+```
+
+##Import and format data for mantel tridecanone
+```{r}
+df<-read.csv("formantel.csv", header=TRUE)
+#abundance data frame
+abund = df[,78:ncol(df)]
+#tridecanone
+oiltridecanone = df$Prop2Tridecanone
+#abundance data frame - bray curtis dissimilarity
+dist.abund = vegdist(abund, method = "bray")
+
+#oil - euclidean distance
+dist.oiltridecanone = dist(oiltridecanone, method = "euclidean")
+
+#abundance vs tridecanone mantel
+abund_tridecanone = mantel(dist.abund, dist.oiltridecanone, method = "spearman", permutations = 9999, na.rm = TRUE)
+abund_tridecanone
+```
+
+##Import and format data for mantel tetradecanone
+```{r}
+df<-read.csv("formantel.csv", header=TRUE)
+#abundance data frame
+abund = df[,78:ncol(df)]
+#tetradecanone
+oiltetradecanone = df$Prop2Tetradecanone
+#abundance data frame - bray curtis dissimilarity
+dist.abund = vegdist(abund, method = "bray")
+
+#oil - euclidean distance
+dist.oiltetradecanone = dist(oiltetradecanone, method = "euclidean")
+
+#abundance vs tetradecanone mantel
+abund_tetradecanone = mantel(dist.abund, dist.oiltetradecanone, method = "spearman", permutations = 9999, na.rm = TRUE)
+abund_tetradecanone
+```
+
+##Import and format data for mantel pentadecanone
+```{r}
+df<-read.csv("formantel.csv", header=TRUE)
+#abundance data frame
+abund = df[,78:ncol(df)]
+#pentadecanone
+oilpentadecanone = df$Prop2Pentadecanone
+#abundance data frame - bray curtis dissimilarity
+dist.abund = vegdist(abund, method = "bray")
+
+#oil - euclidean distance
+dist.oilpentadecanone = dist(oilpentadecanone, method = "euclidean")
+
+#abundance vs pentadecanone mantel
+abund_pentadecanone = mantel(dist.abund, dist.oilpentadecanone, method = "spearman", permutations = 9999, na.rm = TRUE)
+abund_pentadecanone
+```
+
+##Import and format data for mantel hexadecanone
+```{r}
+df<-read.csv("formantel.csv", header=TRUE)
+#abundance data frame
+abund = df[,78:ncol(df)]
+#hexadecanone
+oilhexadecanone = df$Prop2Hexadecanone
+#abundance data frame - bray curtis dissimilarity
+dist.abund = vegdist(abund, method = "bray")
+
+#oil - euclidean distance
+dist.oilhexadecanone = dist(oilhexadecanone, method = "euclidean")
+
+#abundance vs hexadecanone mantel
+abund_hexadecanone = mantel(dist.abund, dist.oilhexadecanone, method = "spearman", permutations = 9999, na.rm = TRUE)
+abund_hexadecanone
+```
+
+##Import and format data for mantel tetradecanoicacid
+```{r}
+df<-read.csv("formantel.csv", header=TRUE)
+#abundance data frame
+abund = df[,78:ncol(df)]
+#tetradecanoicacid
+oiltetradecanoicacid = df$PropTetradecanoicAcid
+#abundance data frame - bray curtis dissimilarity
+dist.abund = vegdist(abund, method = "bray")
+
+#oil - euclidean distance
+dist.oiltetradecanoicacid = dist(oiltetradecanoicacid, method = "euclidean")
+
+#abundance vs tetradecanoicacid mantel
+abund_tetradecanoicacid = mantel(dist.abund, dist.oiltetradecanoicacid, method = "spearman", permutations = 9999, na.rm = TRUE)
+abund_tetradecanoicacid
+```
+
+##Import and format data for mantel hexadecanoicacid
+```{r}
+df<-read.csv("formantel.csv",header=TRUE)
+#abundance data frame
+abund = df[,78:ncol(df)]
+#hexadecanoicacid
+oilhexadecanoicacid = df$PropHexadecanoicAcid
+#abundance data frame - bray curtis dissimilarity
+dist.abund = vegdist(abund, method = "bray")
+
+#oil - euclidean distance
+dist.oilhexadecanoicacid = dist(oilhexadecanoicacid, method = "euclidean")
+
+#abundance vs hexadecanoicacid mantel
+abund_hexadecanoicacid = mantel(dist.abund, dist.oilhexadecanoicacid, method = "spearman", permutations = 9999, na.rm = TRUE)
+abund_hexadecanoicacid
+```
+
+##Import and format data for mantel octadecanoicacid
+```{r}
+df<-read.csv("formantel.csv", header=TRUE)
+#abundance data frame
+abund = df[,78:ncol(df)]
+#octadecanoicacid
+oiloctadecanoicacid = df$PropOctadecanoicAcid
+#abundance data frame - bray curtis dissimilarity
+dist.abund = vegdist(abund, method = "bray")
+
+#oil - euclidean distance
+dist.oiloctadecanoicacid = dist(oiloctadecanoicacid, method = "euclidean")
+
+#abundance vs octadecanoicacid mantel
+abund_octadecanoicacid = mantel(dist.abund, dist.oiloctadecanoicacid, method = "spearman", permutations = 9999, na.rm = TRUE)
+abund_octadecanoicacid
+```
+
+```{r}
+result <- ancombc2(
+  data = physeqprune01,
+  assay_name = "counts",
+  tax_level = "Genus", # or any other taxonomic level of interest
+  fix_formula = "timepoint", # Assuming 'timepoint' variable differentiates between time0 and time1
+  p_adj_method = "holm",
+  pseudo_sens = TRUE,
+  prv_cut = 0.1,
+  lib_cut = 0,
+  s0_perc = 0.05,
+  group = NULL, # Set to NULL if you're directly comparing two timepoints without additional grouping
+  struc_zero = FALSE,
+  neg_lb = FALSE,
+  alpha = 0.05,
+  n_cl = 1,
+  verbose = FALSE,
+  global = FALSE, # Set to FALSE as you're not performing a global test across multiple groups
+  pairwise = FALSE, # Set to FALSE unless you want to perform pairwise comparisons between groups
+  dunnet = FALSE, # Set to FALSE as it's not applicable for a two-group comparison
+  trend = FALSE # Set to FALSE as you're not testing for trends across ordered groups
+)
+```
