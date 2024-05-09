@@ -25,12 +25,15 @@ pheno_data<-data.frame(ids = c("plank01", "plank02", "biofilm01", "biofilm02"),
 samples.c <- paste('ballgown', pheno_data$ids, sep = '/')
 bg <- ballgown(samples = samples.c, meas='all', pData = pheno_data)
 bg
+save(bg, file="bg.RData")
 ```
 
 # <what is this code doing?>
 ```{r}
 bg_filt = subset(bg,"rowVars(texpr(bg)) >1",genomesubset=TRUE)
 bg_filt
+
+save(bg_filt, file="bg_filt.RData")
 ```
 
 # create a table of transcripts
